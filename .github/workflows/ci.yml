@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install poetry
+
+      - name: Cache Poetry + venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pypoetry
+            .venv
+          key: ${{ runner.os }}-py312-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-py312-poetry-
+
+      - name: Install dependencies (with dev, sync)
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry config installer.parallel true
+          poetry install --with dev --no-interaction --sync
+
+      - name: Black (check)
+        run: poetry run black --check .
+
+      - name: isort (check)
+        run: poetry run isort --check-only .
+
+      - name: mypy
+        run: poetry run mypy .
+
+      - name: pytest
+        run: poetry run pytest

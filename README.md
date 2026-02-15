@@ -1,6 +1,6 @@
 # collector-core
 
-Core Library für Collector/Scraper des [PaZuFa](https://github.com/Chrystalkey/landtagszusammenfasser)s. Enthält gemeinsame Funktionen und Basisklassen.
+Core library for collectors/scrapers of [PaZuFa](https://github.com/Chrystalkey/landtagszusammenfasser), providing shared functionality and base classes.
 
 ## Requirements
 

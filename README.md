@@ -27,9 +27,7 @@ pip install -e .
 ## Usage
 
 ```python
-from collector_core.collector import Collector
-
-collector = Collector()
+import collector_core
 ```
 
 ## Development

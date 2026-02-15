@@ -1,6 +1,10 @@
 # collector-core
 
-Core library for collecting parliamentary data.
+Core Library für Collector/Scraper des [PaZuFa](https://github.com/Chrystalkey/landtagszusammenfasser)s. Enthält gemeinsame Funktionen und Basisklassen.
+
+## Requirements
+
+- Python 3.12+
 
 ## Installation
 
@@ -8,12 +12,16 @@ Install using Poetry:
 
 ```bash
 poetry add collector-core
+# or
+poetry add git+https://github.com/Parlamentszusammenfasser/collector-core.git
 ```
 
 Or with pip:
 
 ```bash
 pip install collector-core
+# or for local dev
+pip install -e .
 ```
 
 ## Usage
@@ -21,12 +29,7 @@ pip install collector-core
 ```python
 from collector_core.collector import Collector
 
-# Create a collector instance
-collector = Collector(name="example")
-
-# Collect data
-data = collector.collect()
-print(data)
+collector = Collector()
 ```
 
 ## Development
@@ -37,9 +40,11 @@ This project uses Poetry for dependency management.
 
 ```bash
 # Install dependencies
-poetry install
+poetry install --with dev
 
-# Run tests
+# Run formatting and tests
+poetry run isort .
+poetry run black .
 poetry run pytest
 ```
 

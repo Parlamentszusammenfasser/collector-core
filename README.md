@@ -44,6 +44,9 @@ poetry install --with dev
 poetry run isort .
 poetry run black .
 poetry run pytest
+
+# to update API model
+poetry run datamodel-codegen
 ```
 
 ## License

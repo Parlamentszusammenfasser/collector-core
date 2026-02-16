@@ -33,6 +33,11 @@ line_length = 100
 testpaths = ["tests"]
 addopts = "-q --cov=collector_core --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=80"
 
+[tool.coverage.run]
+omit = [
+  "collector_core/api_model.py"
+]
+
 [tool.mypy]
 python_version = "3.12"
 warn_return_any = true

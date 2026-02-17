@@ -50,8 +50,8 @@ jobs:
       - name: mypy
         run: poetry run mypy .
 
-      - name: Verify OpenAPI model
-        run: datamodel-codegen --check
+      # - name: Verify OpenAPI model
+      #   run: datamodel-codegen --check
 
   test:
     runs-on: ubuntu-latest

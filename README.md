@@ -47,6 +47,9 @@ poetry run pytest
 
 # to update API model
 poetry run datamodel-codegen
+
+# to update API client
+poetry run python3 tools/generate_openapi_client.py
 ```
 
 ## License

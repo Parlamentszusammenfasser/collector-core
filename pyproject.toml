@@ -16,6 +16,8 @@ isort = "^7.0.0"
 pytest-cov = "^7.0.0"
 mypy = "^1.19.1"
 datamodel-code-generator = {extras = ["http"], version = "^0.54.0"}
+openapi-python-client = "^0.28.2"
+types-python-dateutil = "^2.9.0.20260124"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -35,7 +37,8 @@ addopts = "-q --cov=collector_core --cov-report=term-missing --cov-report=xml:co
 
 [tool.coverage.run]
 omit = [
-  "collector_core/api_model.py"
+  "collector_core/api_model.py",
+  "collector_core/api_client/*",
 ]
 
 [tool.mypy]

@@ -38,6 +38,26 @@ class LLMConnectorError(RuntimeError):
     """Raised when a provider response cannot be parsed as text."""
 
 
+class LLMProviderError(LLMConnectorError):
+    """Raised when the LLM provider returns a known request/response failure."""
+
+
+class LLMAuthenticationError(LLMProviderError):
+    """Raised when provider authentication fails (e.g., invalid or missing API key)."""
+
+
+class LLMQuotaExceededError(LLMProviderError):
+    """Raised when provider quota/budget is exhausted."""
+
+
+class LLMRateLimitError(LLMProviderError):
+    """Raised when provider-side rate limits are exceeded."""
+
+
+class LLMTemporaryProviderError(LLMProviderError):
+    """Raised for transient provider failures (timeout/5xx)."""
+
+
 class AsyncRateLimiter:
     """Limit async calls to `max_calls` within `per_seconds`."""
 
@@ -92,8 +112,16 @@ class LLMConnector:
             rate_limit_window_seconds: Length of the async rate-limit window in seconds.
         """
         self.provider = self._parse_provider(provider)
-        self.model = model.strip() if model else DEFAULT_MODELS[self.provider]
-        self.response_creativity = float(response_creativity)
+        self.model = (
+            self._require_non_empty_text(model, field_name="model")
+            if model is not None
+            else DEFAULT_MODELS[self.provider]
+        )
+        self.response_creativity = self._validate_response_creativity(response_creativity)
+        self._validate_rate_limit_configuration(
+            rate_limit_max_calls=rate_limit_max_calls,
+            rate_limit_window_seconds=rate_limit_window_seconds,
+        )
         self._rate_limiter = (
             AsyncRateLimiter(max_calls=rate_limit_max_calls, per_seconds=rate_limit_window_seconds)
             if rate_limit_max_calls is not None
@@ -105,16 +133,20 @@ class LLMConnector:
             await self._rate_limiter.acquire_slot()
 
         request_kwargs = self._build_request(prompt=prompt, system_prompt=system_prompt)
-        response = await litellm.acompletion(**request_kwargs)
+        try:
+            response = await litellm.acompletion(**request_kwargs)
+        except Exception as exc:
+            raise self._map_provider_exception(exc) from exc
         return self._extract_text(response)
 
     def _build_request(self, prompt: str, system_prompt: str) -> dict[str, Any]:
-        user_prompt = prompt.strip()
-        if not user_prompt:
-            raise ValueError("prompt must not be empty")
+        user_prompt = self._require_non_empty_text(prompt, field_name="prompt")
+        normalized_system_prompt = self._require_non_empty_text(
+            system_prompt, field_name="system_prompt"
+        )
 
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": normalized_system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         return {
@@ -124,12 +156,13 @@ class LLMConnector:
         }
 
     async def summarize(self, text: str, max_sentences: int = 5, language: str = "Deutsch") -> str:
-        source_text = text.strip()
-        if not source_text:
-            raise ValueError("text must not be empty")
+        source_text = self._require_non_empty_text(text, field_name="text")
+        normalized_language = self._require_non_empty_text(language, field_name="language")
+        if max_sentences <= 0:
+            raise ValueError("max_sentences must be greater than 0")
 
         prompt = (
-            f"Fasse den folgenden Text in {language} zusammen. "
+            f"Fasse den folgenden Text in {normalized_language} zusammen. "
             f"Nenne nur die Kernaussagen in maximal {max_sentences} Sätzen.\n\n{source_text}"
         )
         summary_system_prompt = (
@@ -143,7 +176,12 @@ class LLMConnector:
         if isinstance(provider, LLMProvider):
             return provider
 
+        if not isinstance(provider, str):
+            raise ValueError("provider must be an LLMProvider or non-empty string")
+
         normalized = provider.strip().lower()
+        if not normalized:
+            raise ValueError("provider must not be empty")
         try:
             return LLMProvider(normalized)
         except ValueError as exc:
@@ -192,3 +230,81 @@ class LLMConnector:
         if isinstance(obj, dict):
             return obj.get(field)
         return getattr(obj, field, None)
+
+    @staticmethod
+    def _map_provider_exception(exc: Exception) -> LLMProviderError:
+        status_code = LLMConnector._extract_status_code(exc)
+        message = str(exc).lower()
+
+        if status_code in (401, 403) or any(
+            token in message
+            for token in ("unauthenticated", "unauthorized", "authentication", "invalid api key")
+        ):
+            return LLMAuthenticationError("provider authentication failed")
+
+        if (
+            status_code == 402
+            or "insufficient_quota" in message
+            or "quota exceeded" in message
+            or "budget" in message
+        ):
+            return LLMQuotaExceededError("provider quota or budget exhausted")
+
+        if status_code == 429 or "rate limit" in message or "too many requests" in message:
+            return LLMRateLimitError("provider rate limit exceeded")
+
+        if status_code in (408, 500, 502, 503, 504) or any(
+            token in message for token in ("timeout", "timed out", "temporarily unavailable")
+        ):
+            return LLMTemporaryProviderError("temporary provider failure")
+
+        return LLMProviderError(f"provider request failed: {exc}")
+
+    @staticmethod
+    def _extract_status_code(exc: Exception) -> int | None:
+        status_candidates = (
+            getattr(exc, "status_code", None),
+            getattr(exc, "status", None),
+            getattr(exc, "http_status", None),
+        )
+
+        for candidate in status_candidates:
+            if isinstance(candidate, int):
+                return candidate
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            response_status = getattr(response, "status_code", None)
+            if isinstance(response_status, int):
+                return response_status
+
+        return None
+
+    @staticmethod
+    def _require_non_empty_text(value: str, field_name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{field_name} must not be empty")
+        return normalized
+
+    @staticmethod
+    def _validate_response_creativity(value: float) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("response_creativity must be a number") from exc
+
+        if not 0.0 <= normalized <= 2.0:
+            raise ValueError("response_creativity must be between 0.0 and 2.0")
+        return normalized
+
+    @staticmethod
+    def _validate_rate_limit_configuration(
+        rate_limit_max_calls: int | None, rate_limit_window_seconds: float
+    ) -> None:
+        if rate_limit_max_calls is not None and rate_limit_max_calls <= 0:
+            raise ValueError("rate_limit_max_calls must be greater than 0")
+        if rate_limit_window_seconds <= 0:
+            raise ValueError("rate_limit_window_seconds must be greater than 0")

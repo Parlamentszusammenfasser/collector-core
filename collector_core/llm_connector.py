@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import deque
 from enum import StrEnum
@@ -34,9 +35,11 @@ LOGGER = logging.getLogger(__name__)
 RATE_LIMIT_MAX_CALLS: int | None = 20
 RATE_LIMIT_WINDOW_SECONDS: int = 30
 REQUEST_TIMEOUT_SECONDS: float = 60.0
-MAX_RETRIES: int = 2
-RETRY_BASE_DELAY_SECONDS: float = 0.5
+MAX_RETRIES: int = 3
+RETRY_BASE_DELAY_SECONDS: float = 1.0
 RETRY_MAX_DELAY_SECONDS: float = 8.0
+RETRY_JITTER_MIN_SECONDS: float = 0.25
+RETRY_JITTER_MAX_SECONDS: float = 2.0
 
 
 class LLMProvider(StrEnum):
@@ -282,9 +285,7 @@ class LLMConnector:
                 )
                 raise mapped_error from original_error
 
-            # Compute and apply exponential backoff delay before next retry attempt
-            delay = self.retry_base_delay_seconds * (2 ** attempt)
-            backoff_seconds = float(min(delay, self.retry_max_delay_seconds))
+            backoff_seconds = self._compute_retry_delay(attempt)
             LOGGER.info(
                 "Retrying provider call in %.2fs (next_attempt=%s/%s, error_type=%s)",
                 backoff_seconds,
@@ -642,6 +643,12 @@ class LLMConnector:
             raise ValueError(
                 "retry_base_delay_seconds must be less than or equal to retry_max_delay_seconds"
             )
+        if RETRY_JITTER_MIN_SECONDS < 0:
+            raise ValueError("RETRY_JITTER_MIN_SECONDS must be greater than or equal to 0")
+        if RETRY_JITTER_MAX_SECONDS < RETRY_JITTER_MIN_SECONDS:
+            raise ValueError(
+                "RETRY_JITTER_MAX_SECONDS must be greater than or equal to RETRY_JITTER_MIN_SECONDS"
+            )
 
     @staticmethod
     def _is_retryable_error(error: LLMProviderError) -> bool:
@@ -654,3 +661,25 @@ class LLMConnector:
             `True` if retry logic should handle this error type, else `False`.
         """
         return isinstance(error, (LLMRateLimitError, LLMTemporaryProviderError))
+
+    def _compute_retry_delay(self, attempt: int) -> float:
+        """Compute exponential backoff with additive jitter.
+
+        Args:
+            attempt: Zero-based retry attempt index.
+
+        Returns:
+            Retry delay in seconds.
+        """
+        delay = self.retry_base_delay_seconds * (2 ** attempt)
+        capped_delay = float(min(delay, self.retry_max_delay_seconds))
+        jitter = random.uniform(RETRY_JITTER_MIN_SECONDS, RETRY_JITTER_MAX_SECONDS)
+        total_delay = capped_delay + jitter
+        LOGGER.debug(
+            "Computed retry delay (attempt=%s, capped_delay=%.2fs, jitter=%.2fs, total=%.2fs)",
+            attempt + 1,
+            capped_delay,
+            jitter,
+            total_delay,
+        )
+        return total_delay

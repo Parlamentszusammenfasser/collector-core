@@ -13,6 +13,10 @@ LOGGER = logging.getLogger(__name__)
 
 RATE_LIMIT_MAX_CALLS: int | None = 20
 RATE_LIMIT_WINDOW_SECONDS: int = 30
+REQUEST_TIMEOUT_SECONDS: float = 60.0
+MAX_RETRIES: int = 2
+RETRY_BASE_DELAY_SECONDS: float = 0.5
+RETRY_MAX_DELAY_SECONDS: float = 8.0
 
 
 class LLMProvider(StrEnum):
@@ -58,7 +62,7 @@ class LLMTemporaryProviderError(LLMProviderError):
     """Raised for transient provider failures (timeout/5xx)."""
 
 
-class AsyncRateLimiter:
+class RateLimiter:
     """Limit async calls to `max_calls` within `per_seconds`."""
 
     def __init__(self, max_calls: int, per_seconds: float) -> None:
@@ -100,6 +104,8 @@ class LLMConnector:
         response_creativity: float = 0.2,
         rate_limit_max_calls: int | None = RATE_LIMIT_MAX_CALLS,
         rate_limit_window_seconds: float = RATE_LIMIT_WINDOW_SECONDS,
+        timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
         """Initialize a provider-specific text generation connector.
 
@@ -110,6 +116,8 @@ class LLMConnector:
                 temperature). Lower values are more deterministic.
             rate_limit_max_calls: Optional max number of async calls in the configured time window.
             rate_limit_window_seconds: Length of the async rate-limit window in seconds.
+            timeout_seconds: Timeout per provider call in seconds.
+            max_retries: Number of retry attempts for retryable provider errors.
         """
         self.provider = self._parse_provider(provider)
         self.model = (
@@ -122,22 +130,48 @@ class LLMConnector:
             rate_limit_max_calls=rate_limit_max_calls,
             rate_limit_window_seconds=rate_limit_window_seconds,
         )
+        self.timeout_seconds: float = self._validate_timeout_seconds(timeout_seconds)
+        self.max_retries: int = self._validate_max_retries(max_retries)
+        self.retry_base_delay_seconds: float = RETRY_BASE_DELAY_SECONDS
+        self.retry_max_delay_seconds: float = RETRY_MAX_DELAY_SECONDS
+        self._validate_retry_delay_constants()
         self._rate_limiter = (
-            AsyncRateLimiter(max_calls=rate_limit_max_calls, per_seconds=rate_limit_window_seconds)
+            RateLimiter(max_calls=rate_limit_max_calls, per_seconds=rate_limit_window_seconds)
             if rate_limit_max_calls is not None
             else None
         )
 
     async def generate_text(self, prompt: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
-        if self._rate_limiter is not None:
-            await self._rate_limiter.acquire_slot()
-
         request_kwargs = self._build_request(prompt=prompt, system_prompt=system_prompt)
-        try:
-            response = await litellm.acompletion(**request_kwargs)
-        except Exception as exc:
-            raise self._map_provider_exception(exc) from exc
-        return self._extract_text(response)
+        for attempt in range(self.max_retries + 1):
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire_slot()
+
+            try:
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**request_kwargs), timeout=self.timeout_seconds
+                )
+                return self._extract_text(response)
+            except asyncio.TimeoutError as exc:
+                mapped_error: LLMProviderError = LLMTemporaryProviderError(
+                    "provider request timed out"
+                )
+                original_error: Exception = exc
+            except Exception as exc:
+                mapped_error = self._map_provider_exception(exc)
+                original_error = exc
+
+            should_retry: bool = attempt < self.max_retries and self._is_retryable_error(mapped_error)
+            if not should_retry:
+                raise mapped_error from original_error
+
+            # Compute and apply exponential backoff delay before next retry attempt
+            delay = self.retry_base_delay_seconds * (2 ** attempt)
+            backoff_seconds = float(min(delay, self.retry_max_delay_seconds))
+
+            await asyncio.sleep(backoff_seconds)
+
+        raise LLMConnectorError("unreachable retry loop state")
 
     def _build_request(self, prompt: str, system_prompt: str) -> dict[str, Any]:
         user_prompt = self._require_non_empty_text(prompt, field_name="prompt")
@@ -308,3 +342,29 @@ class LLMConnector:
             raise ValueError("rate_limit_max_calls must be greater than 0")
         if rate_limit_window_seconds <= 0:
             raise ValueError("rate_limit_window_seconds must be greater than 0")
+
+    @staticmethod
+    def _validate_timeout_seconds(timeout_seconds: float) -> float:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than 0")
+        return float(timeout_seconds)
+
+    @staticmethod
+    def _validate_max_retries(max_retries: int) -> int:
+        if max_retries < 0:
+            raise ValueError("max_retries must be greater than or equal to 0")
+        return max_retries
+
+    def _validate_retry_delay_constants(self) -> None:
+        if self.retry_base_delay_seconds <= 0:
+            raise ValueError("retry_base_delay_seconds must be greater than 0")
+        if self.retry_max_delay_seconds <= 0:
+            raise ValueError("retry_max_delay_seconds must be greater than 0")
+        if self.retry_base_delay_seconds > self.retry_max_delay_seconds:
+            raise ValueError(
+                "retry_base_delay_seconds must be less than or equal to retry_max_delay_seconds"
+            )
+
+    @staticmethod
+    def _is_retryable_error(error: LLMProviderError) -> bool:
+        return isinstance(error, (LLMRateLimitError, LLMTemporaryProviderError))

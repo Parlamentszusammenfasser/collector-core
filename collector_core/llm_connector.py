@@ -275,7 +275,9 @@ class LLMConnector:
                     type(mapped_error).__name__,
                 )
 
-            should_retry: bool = attempt < self.max_retries and self._is_retryable_error(mapped_error)
+            should_retry: bool = attempt < self.max_retries and self._is_retryable_error(
+                mapped_error
+            )
             if not should_retry:
                 LOGGER.error(
                     "Provider request failed without retry (attempt=%s/%s, error_type=%s)",
@@ -391,7 +393,9 @@ class LLMConnector:
             return LLMProvider(normalized)
         except ValueError as exc:
             allowed = ", ".join(item.value for item in LLMProvider)
-            raise ValueError(f"unsupported provider '{provider}', expected one of: {allowed}") from exc
+            raise ValueError(
+                f"unsupported provider '{provider}', expected one of: {allowed}"
+            ) from exc
 
     @staticmethod
     def _extract_text(response: Any) -> str:
@@ -481,7 +485,9 @@ class LLMConnector:
             token in message
             for token in ("unauthenticated", "unauthorized", "authentication", "invalid api key")
         ):
-            LOGGER.debug("Mapped provider error to authentication error (status_code=%s)", status_code)
+            LOGGER.debug(
+                "Mapped provider error to authentication error (status_code=%s)", status_code
+            )
             return LLMAuthenticationError("provider authentication failed")
 
         if (
@@ -500,10 +506,14 @@ class LLMConnector:
         if status_code in (408, 500, 502, 503, 504) or any(
             token in message for token in ("timeout", "timed out", "temporarily unavailable")
         ):
-            LOGGER.debug("Mapped provider error to temporary provider error (status_code=%s)", status_code)
+            LOGGER.debug(
+                "Mapped provider error to temporary provider error (status_code=%s)", status_code
+            )
             return LLMTemporaryProviderError("temporary provider failure")
 
-        LOGGER.debug("Mapped provider error to generic provider error (status_code=%s)", status_code)
+        LOGGER.debug(
+            "Mapped provider error to generic provider error (status_code=%s)", status_code
+        )
         return LLMProviderError(f"provider request failed: {exc}")
 
     @staticmethod
@@ -671,7 +681,7 @@ class LLMConnector:
         Returns:
             Retry delay in seconds.
         """
-        delay = self.retry_base_delay_seconds * (2 ** attempt)
+        delay = self.retry_base_delay_seconds * (2**attempt)
         capped_delay = float(min(delay, self.retry_max_delay_seconds))
         jitter = random.uniform(RETRY_JITTER_MIN_SECONDS, RETRY_JITTER_MAX_SECONDS)
         total_delay = capped_delay + jitter

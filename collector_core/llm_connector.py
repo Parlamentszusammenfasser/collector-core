@@ -1,3 +1,23 @@
+"""Provider-agnostic async connector for LLM text generation and summarization.
+
+Example:
+    ```python
+    import asyncio
+    from collector_core.llm_connector import LLMConnector
+
+    async def main() -> None:
+        connector = LLMConnector(provider="openai", response_creativity=0.1)
+        summary = await connector.summarize(
+            "Langer Quelltext fuer die Zusammenfassung ...",
+            max_sentences=4,
+            language="Deutsch",
+        )
+        print(summary)
+
+    asyncio.run(main())
+    ```
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +40,8 @@ RETRY_MAX_DELAY_SECONDS: float = 8.0
 
 
 class LLMProvider(StrEnum):
+    """Supported upstream LLM providers."""
+
     OPENAI = "openai"
     CLAUDE = "claude"
     MISTRAL = "mistral"
@@ -66,6 +88,15 @@ class RateLimiter:
     """Limit async calls to `max_calls` within `per_seconds`."""
 
     def __init__(self, max_calls: int, per_seconds: float) -> None:
+        """Create a local async sliding-window rate limiter.
+
+        Args:
+            max_calls: Maximum number of calls allowed in one window.
+            per_seconds: Window size in seconds.
+
+        Raises:
+            ValueError: If `max_calls` or `per_seconds` is not greater than zero.
+        """
         if max_calls <= 0:
             raise ValueError("max_calls must be greater than 0")
         if per_seconds <= 0:
@@ -82,6 +113,11 @@ class RateLimiter:
         )
 
     async def acquire_slot(self) -> None:
+        """Wait until one call slot is available and reserve it.
+
+        Returns:
+            None
+        """
         while True:
             async with self._lock:
                 now = time.monotonic()
@@ -115,7 +151,7 @@ class RateLimiter:
 
 
 class LLMConnector:
-    """Thin provider-agnostic connector for text generation via LiteLLM."""
+    """Thin provider-agnostic connector for async text generation via LiteLLM."""
 
     def __init__(
         self,
@@ -170,6 +206,20 @@ class LLMConnector:
         )
 
     async def generate_text(self, prompt: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
+        """Generate text using the configured model.
+
+        Args:
+            prompt: User input prompt for the model.
+            system_prompt: System-level instruction for model behavior.
+
+        Returns:
+            The generated plain-text model output.
+
+        Raises:
+            ValueError: If prompt/system prompt validation fails.
+            LLMProviderError: If provider call fails and cannot be recovered by retries.
+            LLMConnectorError: If provider response structure cannot be parsed.
+        """
         request_kwargs = self._build_request(prompt=prompt, system_prompt=system_prompt)
         prompt_length = len(request_kwargs["messages"][1]["content"])
         LOGGER.debug(
@@ -248,6 +298,18 @@ class LLMConnector:
         raise LLMConnectorError("unreachable retry loop state")
 
     def _build_request(self, prompt: str, system_prompt: str) -> dict[str, Any]:
+        """Build a LiteLLM chat request payload from validated prompt data.
+
+        Args:
+            prompt: User prompt.
+            system_prompt: System instruction prompt.
+
+        Returns:
+            A LiteLLM-compatible request payload.
+
+        Raises:
+            ValueError: If prompt or system prompt is empty/invalid.
+        """
         user_prompt = self._require_non_empty_text(prompt, field_name="prompt")
         normalized_system_prompt = self._require_non_empty_text(
             system_prompt, field_name="system_prompt"
@@ -264,6 +326,21 @@ class LLMConnector:
         }
 
     async def summarize(self, text: str, max_sentences: int = 5, language: str = "Deutsch") -> str:
+        """Create a concise summary for an input text.
+
+        Args:
+            text: Source text to summarize.
+            max_sentences: Maximum sentence count for the summary.
+            language: Target language for the summary output.
+
+        Returns:
+            A concise generated summary.
+
+        Raises:
+            ValueError: If input validation fails.
+            LLMProviderError: If provider call fails and cannot be recovered by retries.
+            LLMConnectorError: If provider response structure cannot be parsed.
+        """
         source_text = self._require_non_empty_text(text, field_name="text")
         normalized_language = self._require_non_empty_text(language, field_name="language")
         if max_sentences <= 0:
@@ -289,6 +366,17 @@ class LLMConnector:
 
     @staticmethod
     def _parse_provider(provider: LLMProvider | str) -> LLMProvider:
+        """Normalize and validate a provider value into `LLMProvider`.
+
+        Args:
+            provider: Provider enum value or provider string.
+
+        Returns:
+            Parsed provider enum value.
+
+        Raises:
+            ValueError: If provider is empty or unsupported.
+        """
         if isinstance(provider, LLMProvider):
             return provider
 
@@ -306,6 +394,17 @@ class LLMConnector:
 
     @staticmethod
     def _extract_text(response: Any) -> str:
+        """Extract plain text content from a provider response object.
+
+        Args:
+            response: Raw LiteLLM provider response object.
+
+        Returns:
+            Extracted plain-text output.
+
+        Raises:
+            LLMConnectorError: If expected response fields are missing or empty.
+        """
         choices = LLMConnector._get_field(response, "choices")
         if not isinstance(choices, list) or not choices:
             raise LLMConnectorError("provider response did not contain choices")
@@ -319,6 +418,14 @@ class LLMConnector:
 
     @staticmethod
     def _normalize_content(content: Any) -> str:
+        """Normalize provider content blocks into a single plain-text string.
+
+        Args:
+            content: Provider response `message.content` field.
+
+        Returns:
+            Normalized text representation.
+        """
         if isinstance(content, str):
             return content.strip()
 
@@ -343,12 +450,29 @@ class LLMConnector:
 
     @staticmethod
     def _get_field(obj: Any, field: str) -> Any:
+        """Read a named field from dict-like or attribute-based objects.
+
+        Args:
+            obj: Source object.
+            field: Field name to read.
+
+        Returns:
+            Field value or `None` when absent.
+        """
         if isinstance(obj, dict):
             return obj.get(field)
         return getattr(obj, field, None)
 
     @staticmethod
     def _map_provider_exception(exc: Exception) -> LLMProviderError:
+        """Map raw provider exceptions to connector-specific error types.
+
+        Args:
+            exc: Raw exception raised by the provider/LiteLLM call.
+
+        Returns:
+            Mapped connector-specific provider error.
+        """
         status_code = LLMConnector._extract_status_code(exc)
         message = str(exc).lower()
 
@@ -383,6 +507,14 @@ class LLMConnector:
 
     @staticmethod
     def _extract_status_code(exc: Exception) -> int | None:
+        """Extract an HTTP-like status code from known exception fields.
+
+        Args:
+            exc: Raw exception object.
+
+        Returns:
+            Extracted HTTP-like status code or `None` if unavailable.
+        """
         status_candidates = (
             getattr(exc, "status_code", None),
             getattr(exc, "status", None),
@@ -403,6 +535,18 @@ class LLMConnector:
 
     @staticmethod
     def _require_non_empty_text(value: str, field_name: str) -> str:
+        """Validate a string input and return its stripped non-empty value.
+
+        Args:
+            value: Input string to validate.
+            field_name: Field name used in validation error messages.
+
+        Returns:
+            Stripped non-empty string.
+
+        Raises:
+            ValueError: If input is not a string or is empty after stripping.
+        """
         if not isinstance(value, str):
             raise ValueError(f"{field_name} must be a string")
         normalized = value.strip()
@@ -412,6 +556,17 @@ class LLMConnector:
 
     @staticmethod
     def _validate_response_creativity(value: float) -> float:
+        """Validate and normalize temperature-like creativity value.
+
+        Args:
+            value: Creativity/temperature-like value.
+
+        Returns:
+            Validated float value.
+
+        Raises:
+            ValueError: If value is not numeric or outside the allowed range.
+        """
         try:
             normalized = float(value)
         except (TypeError, ValueError) as exc:
@@ -425,6 +580,15 @@ class LLMConnector:
     def _validate_rate_limit_configuration(
         rate_limit_max_calls: int | None, rate_limit_window_seconds: float
     ) -> None:
+        """Validate local rate-limit configuration values.
+
+        Args:
+            rate_limit_max_calls: Max calls per window, or `None` to disable local limiting.
+            rate_limit_window_seconds: Window length in seconds.
+
+        Raises:
+            ValueError: If configuration values are invalid.
+        """
         if rate_limit_max_calls is not None and rate_limit_max_calls <= 0:
             raise ValueError("rate_limit_max_calls must be greater than 0")
         if rate_limit_window_seconds <= 0:
@@ -432,17 +596,44 @@ class LLMConnector:
 
     @staticmethod
     def _validate_timeout_seconds(timeout_seconds: float) -> float:
+        """Validate and normalize per-request timeout.
+
+        Args:
+            timeout_seconds: Timeout in seconds.
+
+        Returns:
+            Validated timeout.
+
+        Raises:
+            ValueError: If timeout is not greater than zero.
+        """
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
         return float(timeout_seconds)
 
     @staticmethod
     def _validate_max_retries(max_retries: int) -> int:
+        """Validate retry count configuration.
+
+        Args:
+            max_retries: Number of allowed retries.
+
+        Returns:
+            Validated retry count.
+
+        Raises:
+            ValueError: If retry count is negative.
+        """
         if max_retries < 0:
             raise ValueError("max_retries must be greater than or equal to 0")
         return max_retries
 
     def _validate_retry_delay_constants(self) -> None:
+        """Validate internal retry-delay constants.
+
+        Raises:
+            ValueError: If configured retry-delay constants are invalid.
+        """
         if self.retry_base_delay_seconds <= 0:
             raise ValueError("retry_base_delay_seconds must be greater than 0")
         if self.retry_max_delay_seconds <= 0:
@@ -454,4 +645,12 @@ class LLMConnector:
 
     @staticmethod
     def _is_retryable_error(error: LLMProviderError) -> bool:
+        """Return whether an error type should trigger a retry attempt.
+
+        Args:
+            error: Mapped connector/provider error.
+
+        Returns:
+            `True` if retry logic should handle this error type, else `False`.
+        """
         return isinstance(error, (LLMRateLimitError, LLMTemporaryProviderError))

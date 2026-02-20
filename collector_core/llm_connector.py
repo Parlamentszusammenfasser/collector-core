@@ -75,6 +75,11 @@ class RateLimiter:
         self.per_seconds = float(per_seconds)
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
+        LOGGER.debug(
+            "Initialized rate limiter (max_calls=%s, per_seconds=%s)",
+            self.max_calls,
+            self.per_seconds,
+        )
 
     async def acquire_slot(self) -> None:
         while True:
@@ -82,14 +87,29 @@ class RateLimiter:
                 now = time.monotonic()
                 cutoff = now - self.per_seconds
 
+                removed_count = 0
                 while self._timestamps and self._timestamps[0] <= cutoff:
                     self._timestamps.popleft()
+                    removed_count += 1
+                if removed_count:
+                    LOGGER.debug("Rate limiter removed %s expired slots", removed_count)
 
                 if len(self._timestamps) < self.max_calls:
                     self._timestamps.append(now)
+                    LOGGER.debug(
+                        "Rate limiter granted slot (%s/%s in current window)",
+                        len(self._timestamps),
+                        self.max_calls,
+                    )
                     return
 
                 wait_seconds = self.per_seconds - (now - self._timestamps[0])
+                LOGGER.debug(
+                    "Rate limiter reached limit (%s/%s); waiting %.3fs",
+                    len(self._timestamps),
+                    self.max_calls,
+                    max(wait_seconds, 0.0),
+                )
 
             await asyncio.sleep(max(wait_seconds, 0.0))
 
@@ -140,16 +160,45 @@ class LLMConnector:
             if rate_limit_max_calls is not None
             else None
         )
+        LOGGER.info(
+            "Initialized LLMConnector (provider=%s, model=%s, rate_limit_enabled=%s, timeout=%.1fs, max_retries=%s)",
+            self.provider.value,
+            self.model,
+            self._rate_limiter is not None,
+            self.timeout_seconds,
+            self.max_retries,
+        )
 
     async def generate_text(self, prompt: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
         request_kwargs = self._build_request(prompt=prompt, system_prompt=system_prompt)
+        prompt_length = len(request_kwargs["messages"][1]["content"])
+        LOGGER.debug(
+            "Starting text generation (provider=%s, model=%s, prompt_chars=%s, retries=%s)",
+            self.provider.value,
+            self.model,
+            prompt_length,
+            self.max_retries,
+        )
+
         for attempt in range(self.max_retries + 1):
             if self._rate_limiter is not None:
+                LOGGER.debug("Waiting for local rate-limiter slot (attempt=%s)", attempt + 1)
                 await self._rate_limiter.acquire_slot()
 
             try:
+                LOGGER.debug(
+                    "Calling provider (attempt=%s/%s, timeout=%.1fs)",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    self.timeout_seconds,
+                )
                 response = await asyncio.wait_for(
                     litellm.acompletion(**request_kwargs), timeout=self.timeout_seconds
+                )
+                LOGGER.debug(
+                    "Provider call successful (attempt=%s/%s)",
+                    attempt + 1,
+                    self.max_retries + 1,
                 )
                 return self._extract_text(response)
             except asyncio.TimeoutError as exc:
@@ -157,17 +206,42 @@ class LLMConnector:
                     "provider request timed out"
                 )
                 original_error: Exception = exc
+                LOGGER.warning(
+                    "Provider timeout (attempt=%s/%s, timeout=%.1fs)",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    self.timeout_seconds,
+                )
             except Exception as exc:
                 mapped_error = self._map_provider_exception(exc)
                 original_error = exc
+                LOGGER.warning(
+                    "Provider call failed (attempt=%s/%s, error_type=%s)",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    type(mapped_error).__name__,
+                )
 
             should_retry: bool = attempt < self.max_retries and self._is_retryable_error(mapped_error)
             if not should_retry:
+                LOGGER.error(
+                    "Provider request failed without retry (attempt=%s/%s, error_type=%s)",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    type(mapped_error).__name__,
+                )
                 raise mapped_error from original_error
 
             # Compute and apply exponential backoff delay before next retry attempt
             delay = self.retry_base_delay_seconds * (2 ** attempt)
             backoff_seconds = float(min(delay, self.retry_max_delay_seconds))
+            LOGGER.info(
+                "Retrying provider call in %.2fs (next_attempt=%s/%s, error_type=%s)",
+                backoff_seconds,
+                attempt + 2,
+                self.max_retries + 1,
+                type(mapped_error).__name__,
+            )
 
             await asyncio.sleep(backoff_seconds)
 
@@ -194,6 +268,12 @@ class LLMConnector:
         normalized_language = self._require_non_empty_text(language, field_name="language")
         if max_sentences <= 0:
             raise ValueError("max_sentences must be greater than 0")
+        LOGGER.debug(
+            "Starting summarization (language=%s, max_sentences=%s, input_chars=%s)",
+            normalized_language,
+            max_sentences,
+            len(source_text),
+        )
 
         prompt = (
             f"Fasse den folgenden Text in {normalized_language} zusammen. "
@@ -203,7 +283,9 @@ class LLMConnector:
             "Du bist ein Assistent für politische und juristische Texte. "
             "Schreibe nüchtern, präzise und ohne Spekulation."
         )
-        return await self.generate_text(prompt=prompt, system_prompt=summary_system_prompt)
+        result = await self.generate_text(prompt=prompt, system_prompt=summary_system_prompt)
+        LOGGER.debug("Summarization completed (output_chars=%s)", len(result))
+        return result
 
     @staticmethod
     def _parse_provider(provider: LLMProvider | str) -> LLMProvider:
@@ -274,6 +356,7 @@ class LLMConnector:
             token in message
             for token in ("unauthenticated", "unauthorized", "authentication", "invalid api key")
         ):
+            LOGGER.debug("Mapped provider error to authentication error (status_code=%s)", status_code)
             return LLMAuthenticationError("provider authentication failed")
 
         if (
@@ -282,16 +365,20 @@ class LLMConnector:
             or "quota exceeded" in message
             or "budget" in message
         ):
+            LOGGER.debug("Mapped provider error to quota exceeded (status_code=%s)", status_code)
             return LLMQuotaExceededError("provider quota or budget exhausted")
 
         if status_code == 429 or "rate limit" in message or "too many requests" in message:
+            LOGGER.debug("Mapped provider error to rate limit (status_code=%s)", status_code)
             return LLMRateLimitError("provider rate limit exceeded")
 
         if status_code in (408, 500, 502, 503, 504) or any(
             token in message for token in ("timeout", "timed out", "temporarily unavailable")
         ):
+            LOGGER.debug("Mapped provider error to temporary provider error (status_code=%s)", status_code)
             return LLMTemporaryProviderError("temporary provider failure")
 
+        LOGGER.debug("Mapped provider error to generic provider error (status_code=%s)", status_code)
         return LLMProviderError(f"provider request failed: {exc}")
 
     @staticmethod
